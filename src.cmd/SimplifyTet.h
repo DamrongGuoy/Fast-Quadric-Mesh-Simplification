@@ -1,3 +1,14 @@
+// SimplifyTet.h
+//
+// Change Simplify.h for surface meshes to SimplifyTet.h for volume meshes
+//
+// (C) by Damrong Guoy in 2025
+//
+// License : MIT
+// http://opensource.org/licenses/MIT
+//
+// The original license for Simplify.h is below.
+
 /////////////////////////////////////////////
 //
 // Mesh Simplification Tutorial
@@ -306,7 +317,7 @@ class SymetricMatrix {
 };
 ///////////////////////////////////////////
 
-namespace Simplify
+namespace SimplifyTet
 {
 	// Global Variables & Strctures
 	enum Attributes {
