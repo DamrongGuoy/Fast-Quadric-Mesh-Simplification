@@ -38,6 +38,8 @@
 #include <math.h>
 #include <float.h> //FLT_EPSILON, DBL_EPSILON
 
+#include <algorithm>
+
 #define loopi(start_l,end_l) for ( int i=start_l;i<end_l;++i )
 #define loopi(start_l,end_l) for ( int i=start_l;i<end_l;++i )
 #define loopj(start_l,end_l) for ( int j=start_l;j<end_l;++j )
@@ -290,7 +292,7 @@ class SymetricMatrix {
 
 	double det(	int a11, int a12, int a13,
 				int a21, int a22, int a23,
-				int a31, int a32, int a33)
+				int a31, int a32, int a33) const
 	{
 		double det =  m[a11]*m[a22]*m[a33] + m[a13]*m[a21]*m[a32] + m[a12]*m[a23]*m[a31]
 					- m[a13]*m[a22]*m[a31] - m[a11]*m[a23]*m[a32]- m[a12]*m[a21]*m[a33];
@@ -321,33 +323,214 @@ namespace SimplifyTet
 {
 	// Global Variables & Strctures
 	enum Attributes {
-		NONE,
-		NORMAL = 2,
-		TEXCOORD = 4,
-		COLOR = 8
+		NONE,  // unused
+		NORMAL = 2,  // unused
+		TEXCOORD = 4,  // used for OBJ file's texture coordinates: "vt" flag
+		COLOR = 8  // unused
 	};
+	// v : three Vertex's of the triangle.
+	// err : err[i] = error on edge i {v_i, v_i+1} of the triangle, 0 <= i < 3,
+	//       err[3] = minimum error among the three edges of the triangle.
+	//              = min {err[0], err[1], err[2]}.
+	// deleted : 1 if this triangle has been deleted by an edge contraction,
+	//           0 otherwise.
+	// dirty : 0 at the beginning of each main loop (0 <= iteration < 100) in
+	//         simplify_mesh().
+	//         1 if the triangle was updated in update_triangles()
+	// attr :  TEXCOORD if this triangle has texture coordinates uvs[3], i.e.,
+	//                  the input was loaded from an OBJ file with "vt" lines,
+	//                  and this triangle corresponds to the line with the
+	//                  pattern "f %d/%d/%d %d/%d/%d %d/%d/%d" or
+	//                  "f %d/%d %d/%d %d/%d" in the OBJ file.
+	//         0 otherwise.
+	// n : unit normal vector of the triangle.
+	// uvs[3] : texture coordinates at the three vertices of the triangle if
+	//          attr == TEXCOORD.
+	// material : material index of the triangle from the OBJ file.
+	//            -1 if the input mesh was loaded from an MZ3 file.
 	struct Triangle { int v[3];double err[4];int deleted,dirty,attr;vec3f n;vec3f uvs[3];int material; };
+	// p : position (a.k.a. coordinates) of this Vertex of the mesh.
+	// tstart : index into refs, see refs[] below,
+	// tcount : how many triangles share this Vertex.
+	//          N.B. the {refs[k], tstart <= k < tstart + tcount} corresponds
+	//          to all the triangles sharing this Vertex.
+	// q : the quadric (quadratic error function) of the vertex. It's a
+	//     4x4 symmetric semi-definite matrix represented as 4+3+2+1 = 10
+	//     double-precision numbers.
+	// border : 1 if this Vertex is on the boundary curve of the surface,
+	//          0 otherwise.
+	//          `border` is set in update_mesh() and used in simplify_mesh(),
+	//          compact_mesh(), and calculate_error().
 	struct Vertex { vec3f p;int tstart,tcount;SymetricMatrix q;int border;};
+	// 0 <= tid < triangles.size(), and 0 <= tvertex < 3.
 	struct Ref { int tid,tvertex; };
 	std::vector<Triangle> triangles;
 	std::vector<Vertex> vertices;
+	// TLDR; this is a kind of run-length encoding of vertex-to-{triangles}
+	// relation (one-to-many relation).
+	//
+	// It has the following properties:
+	//
+	// 1. refs.size() == 3 * triangles.size().
+	//
+	// 2. Each "Vertex v : vertices" has as many as v.tcount entries in refs[].
+	//    They are:
+	//        refs_v = { refs[i] : v.tstart <= i < v.tstart + v.tcount }.
+	//    For each ref \in refs_v, ref.tid is the index of a Triangle sharing
+	//    the Vertex v, i.e., the indices of the Triangle's sharing Vertex v
+	//    are:
+	//        { refs[i].tid : v.tstart <= i < v.tstart + v.tcount}.
+	//    Furthermore, the ref.tvertex is the local index of the Vertex v in
+	//    that Triangle (recall 0 <= ref.tvertex < 3), i.e.,
+	//        for (v.tstart <= i < v.tstart + v.tcount) {
+	//          int v_index = triangles.at(refs[i].tid).v[refs[i].tvertex];
+	//          ASSERT_TRUE(&v == &vertices.at(v_index));
+	//        }
+	//
+	// 3. Each Triangle t = triangles[t_index] corresponds to three entries
+	//    in refs[]. They are { ref \in refs : ref.tid == t_index }.
+	//
+	// 4. Each tuple (v_index, t_index), where:
+	//       - 0 <= v_index < vertices.size(),
+	//       - 0 <= t_index < triangles.size(), and
+	//       - v = vertices.at(v_index) is a vertex of
+	//         t = triangles.at(t_index),
+	//    corresponds to one entry in refs. That is the ref \in refs[] with
+	//    this property:
+	//      ref.tid == t_index && t.v[ref.tvertex] == v_index.
 	std::vector<Ref> refs;
+	// Name of mtllib in the "mtllib" line of the input OBJ file.
 	std::string mtllib;
+	// The names of the materials from the "usemtl" lines in the input
+	// OBJ file.
 	std::vector<std::string> materials;
 
 	// Helper functions
 
+	// Quadric error of a general point (x,y,z) with respect to the
+	// quadric q of a Vertex, i.e., the "SymetricMatrix Vertex::q".
 	double vertex_error(SymetricMatrix q, double x, double y, double z);
+
+	// Return the quadric error associated with the contraction of the
+	// edge between two vertices with vertex indices id_v1 and id_v2.
+	// p_result = position to which the edge contraction between the two
+	//            vertices should go, i.e., the position with the
+	//            minimum quadric error.
 	double calculate_error(int id_v1, int id_v2, vec3f &p_result);
+
+	// Check whether any triangle sharing Vertex v0 would flip from the edge
+	// contraction of v0, v1 to the position p.
+	//
+	// Return false if the edge contraction would be safe for triangles sharing
+	// Vertex v0.
+	// Return true if:
+	//     - the edge contraction would flip the normal of some triangles
+	//       (it would potentially create folding, wrinkle, or
+	//        self-intersection in the surface) or
+	//     - the edge contraction would create a needle triangle.
+	//     In both cases, the caller should prohibit such a contraction.
+	//
+	// p  : position to which the edge contraction of v0,v1 would go.
+	// i0 : global vertex index of Vertex v0; 0 <= i0 < vertices.size().
+	// i1 : global vertex index of Vertex v1; 0 <= i1 < vertices.size().
+	//
+	// param[out] deleted : a vector of integers with deleted.size() equals
+	// the number of triangles sharing Vertex v0. The entry deleted[k]
+	// corresponds to the k-th triangle of Vertex v0. The deleted[k] would
+	// become:
+	//     - 1 if the edge contraction would delete the k-th Triangle of
+	//       Vertex v0 (because that triangle also contains Vertex v1), and
+	//     - no change if the edge contraction would make the k-th Triangle
+	//       become a needle triangle (but the function will return true), and
+	//     - 0, otherwise (that triangle will survive; or that triangle
+	//       will flip its normal, but the function will return true).
+	//
+	// N.B. deleted[] gives additional information when this function returns
+	// false (no flip, valid edge contraction).  Otherwise, it's not reliable
+	// due to the early return true without going through all triangles sharing
+	// Vertex v0.
+	//
+	// @pre deleted.size() == v0.tcount (number of triangles sharing Vertex v0).
+	//
 	bool flipped(vec3f p,int i0,int i1,Vertex &v0,Vertex &v1,std::vector<int> &deleted);
+
+    // Update texture coordinates `vec3f uvs[3]` of each triangle sharing
+    // Vertex v from displacing Vertex v to its new position `p`.
+    //
+    // i0 : unused parameter
+    // v  : Vertex that will move to the new position p.
+    // p  : the new position of Vertex v.
+    // deleted : deleted[k] corresponds to the k-th triangle sharing Vertex v,
+    //           0 <= k < v.tcount. deleted[k] is non-zero for triangle that
+    //           is deleted in the edge contraction.
 	void update_uvs(int i0,const Vertex &v,const vec3f &p,std::vector<int> &deleted);
-	void update_triangles(int i0,Vertex &v,std::vector<int> &deleted,int &deleted_triangles);
+
+
+	// Go through all non-deleted Triangle t (t.deleted == 0) sharing Vertex v.
+	//
+	// If Triangle t will be deleted due to the edge contraction, set
+	// t.deleted = 1, and increment num_deleted_triangles. Do not update
+	// Triangle t.{v, dirty, err}. Do not update refs[].
+	//
+	// @note  The to-be-deleted Triangle t will get t.deleted = 1, so next
+	//        time, we won't double count the num_deleted_triangles.
+    //
+	// If Triangle t will survive the edge contraction,
+	// - Replace Vertex v in Triangle t with Vertex vertices[i0] by setting
+	//   t.v[local index of v] = i0 (this is no-op if vertices[i0] == v),
+	// - Set the dirty bit t.dirty.
+	// - Update the t.err[] QEM of the three edges of Triangle t.
+	// - Partially update refs[] by appending refs[] with copies of
+	//   corresponding entries of refs to the non-deleted Triangle t sharing
+	//   Vertex v.
+	//
+	// @pre 0 <= i0 < vertices.size()
+	//
+	// i0 : global index of target Vertex, which could be either
+	//      Vertex v0 that already got updated to the new position or its
+	//      mate Vertex v1 in the edge contraction that will loose connection
+	//      to its triangles.
+	//
+	// v: either Vertex v0 or Vertex v1 in the edge contraction.
+	//
+	// deleted: deleted[k] <=> the k-th triangle sharing Vertex v.
+	//          deleted.size() == v.tcount.
+	//          The k-th Triangle t of Vertex v will have its deleted flag
+	//          turn on (set t.deleted = 1) when deleted[k] != 0.
+	// num_deleted_triangles : accumulated counter.
+	//          deleted_triangles += number of triangles sharing Vertex v
+	//          that has its corresponding deleted[k] != 0.
+	//
+	void update_triangles(int i0,Vertex &v,std::vector<int> &deleted,
+						  int &num_deleted_triangles);
+
+	// Update the mesh.
+	//
+	// simplify_mesh() calls update_mesh() at initialization and also every
+	// 5-th interation.
+	//
+	// For non-initialization, compact the triangles[] vector by dropping
+	// the triangles marked for deletion (Triangle::deleted != 0).
+	//
+	// For any iteration, refresh {tstart, tcount} of all vertices[] and
+	// {tid, tvertex} of all refs[] from the triangle-to-vertices
+	// {Triangle::v[]} of triangles[].
+	//
+	// For the first iteration, create the {border} and the quadric matrix {q}
+	// of all vertices[]. Furthermore, create the quadric error measure {err}
+	// of all edges of all triangles[].
+	//
 	void update_mesh(int iteration);
+
+
+	// Remove deleted triangles and unused vertices before writing
+	// the simplified mesh.
 	void compact_mesh();
+
 	//
 	// Main simplification function
 	//
-	// target_count  : target nr. of triangles
+	// target_count  : target number of triangles
 	// agressiveness : sharpness to increase the threshold.
 	//                 5..8 are good numbers
 	//                 more iterations yield higher quality
@@ -362,16 +545,19 @@ namespace SimplifyTet
 		}
 
 		// main iteration loop
-		int deleted_triangles=0;
+		int num_deleted_triangles=0;
 		std::vector<int> deleted0,deleted1;
-		int triangle_count=triangles.size();
-		//int iteration = 0;
-		//loop(iteration,0,100)
+		const int num_triangles=triangles.size();
 		for (int iteration = 0; iteration < 100; iteration ++)
 		{
-			if(triangle_count-deleted_triangles<=target_count)break;
+			if(num_triangles - num_deleted_triangles <= target_count) {
+			  // We have reached the target.
+			  break;
+			}
 
 			// update mesh once in a while
+			// Update the mesh at initialization, and every 5th iteration
+			// afterward.
 			if(iteration%5==0)
 			{
 				update_mesh(iteration);
@@ -380,38 +566,84 @@ namespace SimplifyTet
 			// clear dirty flag
 			loopi(0,triangles.size()) triangles[i].dirty=0;
 
+			// Increase the error `threshold` as we go from one iteration to
+			// the next.  As a result, we will select Triangle with smaller
+			// quadric error measures in the earlier iteration.
 			//
-			// All triangles with edges below the threshold will be removed
+			// All triangles with edges below the `threshold` will be
+			// candidates for edge contractions.
 			//
 			// The following numbers works well for most models.
 			// If it does not, try to adjust the 3 parameters
 			//
-			double threshold = 0.000000001*pow(double(iteration+3),agressiveness);
+			double threshold = (1e-9)*pow(double(iteration+3), agressiveness);
 
-			// target number of triangles reached ? Then break
 			if ((verbose) && (iteration%5==0)) {
-				printf("iteration %d - triangles %d threshold %g\n",iteration,triangle_count-deleted_triangles, threshold);
+				printf("iteration %d - triangles %d threshold %g\n",
+					   iteration, num_triangles - num_deleted_triangles,
+					   threshold);
 			}
 
+			// Loop through each Triangle t = triangles[i].
 			// remove vertices & mark deleted triangles
 			loopi(0,triangles.size())
 			{
 				Triangle &t=triangles[i];
-				if(t.err[3]>threshold) continue;
-				if(t.deleted) continue;
-				if(t.dirty) continue;
+				if(t.err[3]>threshold) {
+					// Skip Triangle with its minimum error measure,
+					// err[3], above the `threshold`.
+					continue;
+				}
+				if(t.deleted) {
+					// Skip already deleted Triangle.
+					continue;
+				}
+				if(t.dirty) {
+					// Skip an updated triangle. It has participated in
+					// the previous edge contraction.  See update_triangles().
+					continue;
+				}
 
+				// Loop through the three edges of Triangle t. Consider only
+				// the j-th edge, 0 <= j < 3, with its quadric error measure
+				// less than the `threshold`.
 				loopj(0,3)if(t.err[j]<threshold)
 				{
-
+					// The j-th edge, 0 <= j < 3, of Triangle t has
+					// vertices t.v[j] and t.v[j+1] (index modulo 3).
+					// Call these two Vertexes v0 and v1 with the global
+					// vertex index i0 and i1, 0 <= i0, i1 < vertices.size(),
+					// respectively.
 					int i0=t.v[ j     ]; Vertex &v0 = vertices[i0];
 					int i1=t.v[(j+1)%3]; Vertex &v1 = vertices[i1];
+
 					// Border check
-					if(v0.border != v1.border)  continue;
+					// Skip an edge between a border vertex and a non-border
+					// vertex.  We will perform edge contraction on purely
+					// interior edge (both vertices are interior) or purely
+					// border edge (both vertices are border).
+					//
+					// (DamrongGuoy): What would happen to the thin strip with
+					// v0 and v1 on the "opposite" border like this
+					// picture?  Should we allow the edge contraction (v0,v1)
+					// or not?  Will it pinch the strip surface and create a
+					// non-manifold vertex?
+					//
+					//                   v0
+					//    ---------------●------------------
+					//                   |
+					//    ---------------●------------------
+					//                   v1
+					//
+					if(v0.border != v1.border) {
+						continue;
+					}
 
 					// Compute vertex to collapse to
 					vec3f p;
 					calculate_error(i0,i1,p);
+					// deleted0[k] <=> k-th Triangle sharing Vertex v0.
+					// deleted1[k] <=> k-th Triangle sharing Vertex v1.
 					deleted0.resize(v0.tcount); // normals temporarily
 					deleted1.resize(v1.tcount); // normals temporarily
 					// don't remove if flipped
@@ -426,125 +658,180 @@ namespace SimplifyTet
 					}
 
 					// not flipped, so remove edge
-					v0.p=p;
-					v0.q=v1.q+v0.q;
+					// Displace v0 to the new position p, and absorb the QEM
+					// from v1.q into v0.q.
+					v0.p = p;
+					v0.q += v1.q;
 					int tstart=refs.size();
 
-					update_triangles(i0,v0,deleted0,deleted_triangles);
-					update_triangles(i0,v1,deleted1,deleted_triangles);
+					// Call update_triangles() to update QEM t.err[] of all
+					// Triangle t sharing v0 and set t.dirty flag because
+					// v0 has just moved to the new position p and absorbed
+					// QEM from v1.q.
+					update_triangles(i0,v0,deleted0,num_deleted_triangles);
+					// Call update_triangles() to replace the corresponding
+					// entry of v1 in each of v1's Triangle t by the
+					// Vertex v0 (i0 is the global index of v0). Essentially
+					// we replace v1 by v0, whose now position and QEM has
+					// just been updated.
+					update_triangles(i0,v1,deleted1,num_deleted_triangles);
 
+					// The rest of this loop update Vertex v0.{tstart, tcount}
+					// from the partial updates of refs[] in the previous two
+					// calls of update_triangles(). Essentially Vertex v0 will
+					// refer to, through refs[], all Triangle's previously
+					// sharing v0 or sharing v1.
 					int tcount=refs.size()-tstart;
 
 					if(tcount<=v0.tcount)
 					{
 						// save ram
-						if(tcount)memcpy(&refs[v0.tstart],&refs[tstart],tcount*sizeof(Ref));
+						if(tcount) {
+						  // N.B. The refs[tstart,...,tstart + tcount) will
+						  // be copied to refs[v0.tstart,...,v0.tstart + tcount)
+						  // and will become unreferenced. There would be no
+						  // Vertex u with u.tstart == tstart. Calling
+						  // update_mesh() to reconstruct the refs[] from
+						  // triangles[].v[] will remove the dangling records.
+						  //
+						  // memcpy(dest, src, count)
+						  memcpy(&refs[v0.tstart],&refs[tstart],tcount*sizeof(Ref));
+						}
 					}
 					else
 						// append
+						// N.B.  The older refs[{v0.tstart,..., v0.tstart +
+						// v0.tcount}], before this line, will become
+						// unreferenced. There would be no Vertex u with
+						// u.tstart pointing to those records because, after
+						// this line, v0.tstart will point to the new set of
+						// refs[] entries. Calling update_mesh() to reconstruct
+						// the refs[] from triangles[].v[] will remove the
+						// dangling records.
 						v0.tstart=tstart;
 
+					// If 0 < tcount <= v0.tcount, the records
+					// refs[v0.tstart + tcount,...,v0.tstart + v0.tcount)
+				    // will become unreferenced when we update v0.tcount in
+					// this line. Calling update_mesh() to reconstruct the
+					// refs[] from triangles[].v[] will remove the dangling
+					// records.
 					v0.tcount=tcount;
 					break;
 				}
 				// done?
-				if(triangle_count-deleted_triangles<=target_count)break;
+				if(num_triangles-num_deleted_triangles<=target_count)break;
 			}
 		}
 		// clean up mesh
 		compact_mesh();
 	} //simplify_mesh()
 
-	void simplify_mesh_lossless(bool verbose=false)
-	{
-		// init
-		loopi(0,triangles.size()) triangles[i].deleted=0;
-
-		// main iteration loop
-		int deleted_triangles=0;
-		std::vector<int> deleted0,deleted1;
-		int triangle_count=triangles.size();
-		//int iteration = 0;
-		//loop(iteration,0,100)
-		for (int iteration = 0; iteration < 9999; iteration ++)
-		{
-			// update mesh constantly
-			update_mesh(iteration);
-			// clear dirty flag
-			loopi(0,triangles.size()) triangles[i].dirty=0;
-			//
-			// All triangles with edges below the threshold will be removed
-			//
-			// The following numbers works well for most models.
-			// If it does not, try to adjust the 3 parameters
-			//
-			double threshold = DBL_EPSILON; //1.0E-3 EPS;
-			if (verbose) {
-				printf("lossless iteration %d\n", iteration);
-			}
-
-			// remove vertices & mark deleted triangles
-			loopi(0,triangles.size())
-			{
-				Triangle &t=triangles[i];
-				if(t.err[3]>threshold) continue;
-				if(t.deleted) continue;
-				if(t.dirty) continue;
-
-				loopj(0,3)if(t.err[j]<threshold)
-				{
-					int i0=t.v[ j     ]; Vertex &v0 = vertices[i0];
-					int i1=t.v[(j+1)%3]; Vertex &v1 = vertices[i1];
-
-					// Border check
-					if(v0.border != v1.border)  continue;
-
-					// Compute vertex to collapse to
-					vec3f p;
-					calculate_error(i0,i1,p);
-
-					deleted0.resize(v0.tcount); // normals temporarily
-					deleted1.resize(v1.tcount); // normals temporarily
-
-					// don't remove if flipped
-					if( flipped(p,i0,i1,v0,v1,deleted0) ) continue;
-					if( flipped(p,i1,i0,v1,v0,deleted1) ) continue;
-
-					if ( (t.attr & TEXCOORD) == TEXCOORD )
-					{
-						update_uvs(i0,v0,p,deleted0);
-						update_uvs(i0,v1,p,deleted1);
-					}
-
-					// not flipped, so remove edge
-					v0.p=p;
-					v0.q=v1.q+v0.q;
-					int tstart=refs.size();
-
-					update_triangles(i0,v0,deleted0,deleted_triangles);
-					update_triangles(i0,v1,deleted1,deleted_triangles);
-
-					int tcount=refs.size()-tstart;
-
-					if(tcount<=v0.tcount)
-					{
-						// save ram
-						if(tcount)memcpy(&refs[v0.tstart],&refs[tstart],tcount*sizeof(Ref));
-					}
-					else
-						// append
-						v0.tstart=tstart;
-
-					v0.tcount=tcount;
-					break;
-				}
-			}
-			if(deleted_triangles<=0)break;
-			deleted_triangles=0;
-		} //for each iteration
-		// clean up mesh
-		compact_mesh();
-	} //simplify_mesh_lossless()
+// The following simplify_mesh_lossless(bool) version of
+// simplify_mesh(int, double, bool) uses as small a QEM error
+// `threshold` as possible, i.e., DBL_EPSILON.  The simplify_mesh()
+// calculates the threshold from the `double aggressiveness` parameter
+// and returns when the number of triangles reaches the
+// `int target_count`. This version returns when it ran out of edge
+// contraction with extreme accuracy (DBL_EPSILON);/ hence, the name
+// "lossless". Only practically co-planar triangles are removed.
+//
+// This function is not called anywhere. Its call was commented out
+// in the main program Main.cpp.  For now, we will hide this function
+// using the "//".
+//	void simplify_mesh_lossless(bool verbose=false)
+//	{
+//		// init
+//		loopi(0,triangles.size()) triangles[i].deleted=0;
+//
+//		// main iteration loop
+//		int deleted_triangles=0;
+//		std::vector<int> deleted0,deleted1;
+//		int triangle_count=triangles.size();
+//		//int iteration = 0;
+//		//loop(iteration,0,100)
+//		for (int iteration = 0; iteration < 9999; iteration ++)
+//		{
+//			// update mesh constantly
+//			update_mesh(iteration);
+//			// clear dirty flag
+//			loopi(0,triangles.size()) triangles[i].dirty=0;
+//			//
+//			// All triangles with edges below the threshold will be removed
+//			//
+//			// The following numbers works well for most models.
+//			// If it does not, try to adjust the 3 parameters
+//			//
+//			double threshold = DBL_EPSILON; //1.0E-3 EPS;
+//			if (verbose) {
+//				printf("lossless iteration %d\n", iteration);
+//			}
+//
+//			// remove vertices & mark deleted triangles
+//			loopi(0,triangles.size())
+//			{
+//				Triangle &t=triangles[i];
+//				if(t.err[3]>threshold) continue;
+//				if(t.deleted) continue;
+//				if(t.dirty) continue;
+//
+//				loopj(0,3)if(t.err[j]<threshold)
+//				{
+//					int i0=t.v[ j     ]; Vertex &v0 = vertices[i0];
+//					int i1=t.v[(j+1)%3]; Vertex &v1 = vertices[i1];
+//
+//					// Border check
+//					if(v0.border != v1.border)  continue;
+//
+//					// Compute vertex to collapse to.
+//	                   // p will be the new position of that vertex.
+//					vec3f p;
+//					calculate_error(i0,i1,p);
+//
+//	                   // deleted0[k] <=> k-th Triangle sharing Vertex v0.
+//	                   // deleted1[k] <=> k-th Triangle sharing Vertex v1.
+//					deleted0.resize(v0.tcount); // normals temporarily
+//					deleted1.resize(v1.tcount); // normals temporarily
+//
+//					// don't remove if flipped
+//					if( flipped(p,i0,i1,v0,v1,deleted0) ) continue;
+//					if( flipped(p,i1,i0,v1,v0,deleted1) ) continue;
+//
+//					if ( (t.attr & TEXCOORD) == TEXCOORD )
+//					{
+//						update_uvs(i0,v0,p,deleted0);
+//						update_uvs(i0,v1,p,deleted1);
+//					}
+//
+//					// not flipped, so remove edge
+//					v0.p=p;
+//					v0.q=v1.q+v0.q;
+//					int tstart=refs.size();
+//
+//					update_triangles(i0,v0,deleted0,deleted_triangles);
+//					update_triangles(i0,v1,deleted1,deleted_triangles);
+//
+//					int tcount=refs.size()-tstart;
+//
+//					if(tcount<=v0.tcount)
+//					{
+//						// save ram
+//						if(tcount)memcpy(&refs[v0.tstart],&refs[tstart],tcount*sizeof(Ref));
+//					}
+//					else
+//						// append
+//						v0.tstart=tstart;
+//
+//					v0.tcount=tcount;
+//					break;
+//				}
+//			}
+//			if(deleted_triangles<=0)break;
+//			deleted_triangles=0;
+//		} //for each iteration
+//		// clean up mesh
+//		compact_mesh();
+//	} //simplify_mesh_lossless()
 
 
 	// Check if a triangle flips when this edge is removed
@@ -552,29 +839,58 @@ namespace SimplifyTet
 	bool flipped(vec3f p,int i0,int i1,Vertex &v0,Vertex &v1,std::vector<int> &deleted)
 	{
 
+		// Loop over all triangles sharing Vertex v0; 0 <= k < v0.tcount.
 		loopk(0,v0.tcount)
 		{
+			// Triangle t is the k-th triangle sharing Vertex v0.
 			Triangle &t=triangles[refs[v0.tstart+k].tid];
 			if(t.deleted)continue;
 
+			// s is the local index of Vertex v0 in Triangle t.
+			// invariant: 0 <= s < 3.
 			int s=refs[v0.tstart+k].tvertex;
+			// id1 and id2 are global vertex indices of the other two
+			// vertices of Triangle t.
+			// invaraint: 0 <= id1, id2 < vertices.size()
 			int id1=t.v[(s+1)%3];
 			int id2=t.v[(s+2)%3];
 
+			// Triangle t has both Vertex v0 and Vertex v1, whose global
+			// index is i1.  The edge contraction will delete Triangle t later.
+			// Book-keeping: deleted[k] <=> Triangle t.
 			if(id1==i1 || id2==i1) // delete ?
 			{
 
 				deleted[k]=1;
 				continue;
 			}
+			// The edge-contraction would change
+			// Triangle t = {Vertex v0, vertices.at(id1), vertices.at(id2)}
+			// to Triangle {p, vertices.at(id1), vertices.at(id2)}.
+			// Check whether displacing v0 to p would flip the normal of
+			// the triangle.
 			vec3f d1 = vertices[id1].p-p; d1.normalize();
 			vec3f d2 = vertices[id2].p-p; d2.normalize();
-			if(fabs(d1.dot(d2))>0.999) return true;
+			if(fabs(d1.dot(d2))>0.999) {
+				// If the dot product > 0.999, the Triangle {p, vertices[id1],
+				// vertices[id2]} would have a needle angle at p. We don't want
+				// a needle triangle, so we will declare it's a flip.
+				// No change to the deleted[].
+				return true;
+            }
 			vec3f n;
+			// We have checked that the angle at p of Triangle {p,
+			// vertices[id1], vertices[id2]} is not near zero, so the cross
+			// product is reliable.  We will not delete this triangle.
 			n.cross(d1,d2);
 			n.normalize();
 			deleted[k]=0;
-			if(n.dot(t.n)<0.2) return true;
+			if(n.dot(t.n)<0.2) {
+				// Triangle {p, vertices[id1], vertices[id2]} would flip the
+				// normal vector relative to the original Triangle t.
+				// We will prevent this edge contraction.
+				return true;
+            }
 		}
 		return false;
 	}
@@ -583,33 +899,42 @@ namespace SimplifyTet
 
 	void update_uvs(int i0,const Vertex &v,const vec3f &p,std::vector<int> &deleted)
 	{
+	    // Loop through all triangles sharing Vertex v.
 		loopk(0,v.tcount)
 		{
+		    // Look up vertex-to-triangle relation for the k-th triangle
+			// of Vertex v.
 			Ref &r=refs[v.tstart+k];
+			// Triangle t is the k-th triangle of Vertex v.
 			Triangle &t=triangles[r.tid];
 			if(t.deleted)continue;
 			if(deleted[k])continue;
 			vec3f p1=vertices[t.v[0]].p;
 			vec3f p2=vertices[t.v[1]].p;
 			vec3f p3=vertices[t.v[2]].p;
+			// Update texture coordinates of Vertex v in Triangle t.
+			// r.tvertex is the local index of Vertex v in Triangle t,
+			// 0 <= r.tvertex < 3.
 			t.uvs[r.tvertex] = interpolate(p,p1,p2,p3,t.uvs);
 		}
 	}
 
 	// Update triangle connections and edge error after a edge is collapsed
 
-	void update_triangles(int i0,Vertex &v,std::vector<int> &deleted,int &deleted_triangles)
+	void update_triangles(const int i0,Vertex &v,std::vector<int> &deleted,int &num_deleted_triangles)
 	{
+		// dummy output parameter to call calculate_error(); write-only.
 		vec3f p;
+		// Loop through all triangles sharing Vertex v: 0 <= k < v.tcount.
 		loopk(0,v.tcount)
 		{
-			Ref &r=refs[v.tstart+k];
+			const Ref &r=refs[v.tstart+k];
 			Triangle &t=triangles[r.tid];
 			if(t.deleted)continue;
 			if(deleted[k])
 			{
 				t.deleted=1;
-				deleted_triangles++;
+				num_deleted_triangles++;
 				continue;
 			}
 			t.v[r.tvertex]=i0;
@@ -672,72 +997,119 @@ namespace SimplifyTet
 			}
 		}
 
+		if( iteration != 0 ) {
+			return;
+		}
+
 		// Init Quadrics by Plane & Edge Errors
 		//
 		// required at the beginning ( iteration == 0 )
 		// recomputing during the simplification is not required,
 		// but mostly improves the result for closed meshes
 		//
-		if( iteration == 0 )
+
+		// Initialize all border flags of all vertices to 0.
+		loopi(0,vertices.size())
+			vertices[i].border=0;
+
+		// Loop through all Vertex vertices[i], 0 <= i < vertices.size().
+		// In each iteration, we examine the one-ring neighborhood of
+		// Vertex v = vertices[i]. It consists of all triangles sharing the
+		// Vertex v.
+		for (int i = 0; i < vertices.size(); ++i)
 		{
-			// Identify boundary : vertices[].border=0,1
+			const Vertex &v=vertices[i];
+ 			// Identify boundary : vertices[].border=0,1
+			// vcount and vids are parallel.
+			// Invariant: vcount.size() == vids.size().
+			// vcount[i] = how many times we have seen vertices[vids[i]].
+			// vids[i] = global vertex index of the i-th entry.
+			std::vector<int> vcount, vids;
 
-			std::vector<int> vcount,vids;
+			// Loop through all triangles sharing Vertex v, 0 <= j < v.tcount.
+			// Count how many times each neighboring vertex appears.
+			// The neighboring vertices that appears only one time is a border
+			// vertex.  For example, see this picture of the neighborhood
+			// of Vertex v:
+			//
+			//       Va --- v --- Ve
+			//        |    /| \   |
+			//        |  /  |   \ |
+			//       Vb --- Vc ---Vd
+			//
+			// The vertices Va and Ve are border vertices because they appear
+			// only once in this list of vertices of the four triangles sharing
+			// Vertex v:
+			//   {v, Va, Vb}, {v, Vb, Vc}, {v, Vc, Vd}, {v, Vd, Ve}
+			// = {v, *Va*, Vb, v, Vb, Vc, v, Vc, Vd, v, Vd, *Ve*}.
+			// All the other non-v vertices appear twice. The vertex v itself
+			// appears four times, which is the number of triangles in its
+			// one-ring neighborhood.
+			//
+			// Notice that this counting algorithm depends on neither
+			// the order of triangles nor the order of vertices within
+			// each triangle.
+			//
+			// Notice also that, in the above example, we do not set Vertex v
+			// itself as a border vertex yet.  That would happen when we
+			// perform the same counting algorithm on the border vertex Va
+			// or the border vertex Ve.
+			//
+			for (int j = 0; j < v.tcount; ++j) {
+				// Triangle t is the j-th triangle sharing Vertex v.
+				const Triangle& t=triangles.at(refs[v.tstart + j].tid);
 
-			loopi(0,vertices.size())
-				vertices[i].border=0;
-
-			loopi(0,vertices.size())
-			{
-				Vertex &v=vertices[i];
-				vcount.clear();
-				vids.clear();
-				loopj(0,v.tcount)
-				{
-					int k=refs[v.tstart+j].tid;
-					Triangle &t=triangles[k];
-					loopk(0,3)
-					{
-						int ofs=0,id=t.v[k];
-						while(ofs<vcount.size())
-						{
-							if(vids[ofs]==id)break;
-							ofs++;
-						}
-						if(ofs==vcount.size())
-						{
-							vcount.push_back(1);
-							vids.push_back(id);
-						}
-						else
-							vcount[ofs]++;
+				// Go through the k-th vertex of Triangle t.
+				for (int k = 0; k < 3; ++k) {
+					// Global vertex index of the k-th vertex of Triangle t.
+					const int vertex_id = t.v[k];
+					// Index into entries of vcount[] and vids[] that
+					// correspond to the k-th vertex of Triangle t.
+					int s = std::distance(vids.begin(),
+								std::find(vids.begin(), vids.end(),
+										  vertex_id));
+					if(s==vcount.size()) {
+						// The search failed. This is the first time that
+						// we see Vertex vertices[vertex_id].  We will start
+						// a new entry in vcount[] and vids[].
+						vcount.push_back(1);
+						vids.push_back(vertex_id);
 					}
+					else
+						vcount[s]++;
 				}
-				loopj(0,vcount.size()) if(vcount[j]==1)
+			}
+			// Go through all vertices in the neighborhood of Vertex v that
+			// we have seen.
+			for (int j = 0; j < vcount.size(); ++j) {
+			    // If the vertex vertices[vids[j]] has its counter equals 1,
+				// that vertex is a border vertex.
+				if(vcount[j]==1) {
 					vertices[vids[j]].border=1;
+				}
 			}
-			//initialize errors
-			loopi(0,vertices.size())
-				vertices[i].q=SymetricMatrix(0.0);
+		}
+		//initialize errors
+		loopi(0,vertices.size())
+			vertices[i].q=SymetricMatrix(0.0);
 
-			loopi(0,triangles.size())
-			{
-				Triangle &t=triangles[i];
-				vec3f n,p[3];
-				loopj(0,3) p[j]=vertices[t.v[j]].p;
-				n.cross(p[1]-p[0],p[2]-p[0]);
-				n.normalize();
-				t.n=n;
-				loopj(0,3) vertices[t.v[j]].q =
-					vertices[t.v[j]].q+SymetricMatrix(n.x,n.y,n.z,-n.dot(p[0]));
-			}
-			loopi(0,triangles.size())
-			{
-				// Calc Edge Error
-				Triangle &t=triangles[i];vec3f p;
-				loopj(0,3) t.err[j]=calculate_error(t.v[j],t.v[(j+1)%3],p);
-				t.err[3]=min(t.err[0],min(t.err[1],t.err[2]));
-			}
+		loopi(0,triangles.size())
+		{
+			Triangle &t=triangles[i];
+			vec3f n,p[3];
+			loopj(0,3) p[j]=vertices[t.v[j]].p;
+			n.cross(p[1]-p[0],p[2]-p[0]);
+			n.normalize();
+			t.n=n;
+			loopj(0,3) vertices[t.v[j]].q +=
+				SymetricMatrix(n.x,n.y,n.z,-n.dot(p[0]));
+		}
+		loopi(0,triangles.size())
+		{
+			// Calc Edge Error
+			Triangle &t=triangles[i];vec3f p;
+			loopj(0,3) t.err[j]=calculate_error(t.v[j],t.v[(j+1)%3],p);
+			t.err[3]=min(t.err[0],min(t.err[1],t.err[2]));
 		}
 	}
 
@@ -788,10 +1160,10 @@ namespace SimplifyTet
 	{
 		// compute interpolated vertex
 
-		SymetricMatrix q = vertices[id_v1].q + vertices[id_v2].q;
-		bool border = vertices[id_v1].border & vertices[id_v2].border;
+		const SymetricMatrix q = vertices[id_v1].q + vertices[id_v2].q;
+		const bool border = vertices[id_v1].border & vertices[id_v2].border;
 		double error=0;
-		double det = q.det(0, 1, 2, 1, 4, 5, 2, 5, 7);
+		const double det = q.det(0, 1, 2, 1, 4, 5, 2, 5, 7);
 		if ( det != 0 && !border )
 		{
 
@@ -805,12 +1177,12 @@ namespace SimplifyTet
 		else
 		{
 			// det = 0 -> try to find best result
-			vec3f p1=vertices[id_v1].p;
-			vec3f p2=vertices[id_v2].p;
-			vec3f p3=(p1+p2)/2;
-			double error1 = vertex_error(q, p1.x,p1.y,p1.z);
-			double error2 = vertex_error(q, p2.x,p2.y,p2.z);
-			double error3 = vertex_error(q, p3.x,p3.y,p3.z);
+			const vec3f& p1=vertices[id_v1].p;
+			const vec3f& p2=vertices[id_v2].p;
+			const vec3f p3=(p1+p2)/2;
+			const double error1 = vertex_error(q, p1.x,p1.y,p1.z);
+			const double error2 = vertex_error(q, p2.x,p2.y,p2.z);
+			const double error3 = vertex_error(q, p3.x,p3.y,p3.z);
 			error = min(error1, min(error2, error3));
 			if (error1 == error) p_result=p1;
 			if (error2 == error) p_result=p2;
@@ -1061,7 +1433,7 @@ namespace SimplifyTet
 	void load_mz3(const char* filename) {
 		vertices.clear();
 		triangles.clear();
-		int material = -1;
+		const int kMaterial = -1;
 		std::map<std::string, int> material_map;
 		std::vector<vec3f> uvs;
 		std::vector<std::vector<int> > uvMap;
@@ -1107,7 +1479,7 @@ namespace SimplifyTet
 			triangles[i].v[1] = tris[j++];
 			triangles[i].v[2] = tris[j++];
 			triangles[i].attr = 0;
-			triangles[i].material = material;
+			triangles[i].material = kMaterial;
 		}
 		free(tris);
 		free(verts32);
