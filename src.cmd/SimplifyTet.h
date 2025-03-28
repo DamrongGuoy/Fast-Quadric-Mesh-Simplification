@@ -407,15 +407,50 @@ namespace SimplifyTet
 
 	// Helper functions
 
-	// Quadric error of a general point (x,y,z) with respect to the
-	// quadric q of a Vertex, i.e., the "SymetricMatrix Vertex::q".
+	// Quadric error of a point (x,y,z) with respect to the quadric `q` of
+	// a vertex. The quadric `q` is a symmetric semi-definite
+	// 4x4 matrix [Qᵥ]₄,₄.  The quadric error is intuitively a kind of
+	// "non-uniform squared distance" of the point (x,y,z) from an
+	// ellipsoid of [Qᵥ]₄,₄.
+	//
+	//                                     ┌           ┐ ┌   ┐
+	//                                     │           │ │ x │
+	// quadric error (x,y,z) = [ x y z 1 ] │     Qᵥ    │ │ y │
+	//                                     │           │ │ z │
+	//                                     │           │ │ 1 │
+	//                                     └           ┘ └   ┘
+	//
 	double vertex_error(SymetricMatrix q, double x, double y, double z);
 
-	// Return the quadric error associated with the contraction of the
-	// edge between two vertices with vertex indices id_v1 and id_v2.
-	// p_result = position to which the edge contraction between the two
-	//            vertices should go, i.e., the position with the
-	//            minimum quadric error.
+	// Return the quadric error measure of the edge contraction of
+	// two vertices with indices id_v1 and id_v2.
+	//
+	// First it calculates the combined quadric:
+	//
+	//     	[Q]₄,₄ = [Qᵥ₁ + Qᵥ₂]
+	//
+	// of the quadrics Qᵥ₁ and Qᵥ₂ of the two vertices.
+	//
+	// Then, it calculates the optimal position p to replace the
+	// two vertices, i.e., p is the position with the minimum error
+	// with respect to the combined quadric [Qᵥ₁ + Qᵥ₂].
+	//
+	// Finally, it returns the vertex_error() of p with respect to
+	// the combined quadric [Qᵥ₁ + Qᵥ₂], i.e., it returns:
+	//
+	//                      ┌           ┐ ┌     ┐
+	//                      │           │ │ p.x │
+	//    [ p.x p.y p.z 1 ] │ Qᵥ₁ + Qᵥ₂ │ │ p.y │
+	//                      │           │ │ p.z │
+	//                      │           │ │ 1   │
+	//                      └           ┘ └     ┘
+	//
+    //
+	//
+	// @param[out] p_result = position to which the edge contraction
+	//             between the two vertices should go, i.e., the position
+	//             with the minimum quadric error measure.
+	//
 	double calculate_error(int id_v1, int id_v2, vec3f &p_result);
 
 	// Check whether any triangle sharing Vertex v0 would flip from the edge
@@ -486,17 +521,18 @@ namespace SimplifyTet
 	//
 	// @pre 0 <= i0 < vertices.size()
 	//
-	// i0 : global index of target Vertex, which could be either
-	//      Vertex v0 that already got updated to the new position or its
-	//      mate Vertex v1 in the edge contraction that will loose connection
-	//      to its triangles.
+	// i0 : global index of target Vertex.  All triangles connecting to
+	//      Vertex v will connect to Vertex vertices[i0] instead. It is ok
+	//      if vertices[i0] == v.
 	//
 	// v: either Vertex v0 or Vertex v1 in the edge contraction.
 	//
-	// deleted: deleted[k] <=> the k-th triangle sharing Vertex v.
-	//          deleted.size() == v.tcount.
+	// @param[in] deleted: deleted[k] <=> the k-th triangle sharing Vertex v.
 	//          The k-th Triangle t of Vertex v will have its deleted flag
 	//          turn on (set t.deleted = 1) when deleted[k] != 0.
+	//
+	// @pre deleted.size() == v.tcount.
+	//
 	// num_deleted_triangles : accumulated counter.
 	//          deleted_triangles += number of triangles sharing Vertex v
 	//          that has its corresponding deleted[k] != 0.
@@ -519,6 +555,48 @@ namespace SimplifyTet
 	// For the first iteration, create the {border} and the quadric matrix {q}
 	// of all vertices[]. Furthermore, create the quadric error measure {err}
 	// of all edges of all triangles[].
+	//
+	// On initialization (iteration == 0), each Vertex v accumulates the
+	// quadrics Qₜ from its incident triangles:
+	//
+	//    [Qᵥ]₄,₄ = ∑ [Qₜ]; Triangle t shares Vertex v.
+	//
+	// The fundamental quadric [Qₜ] of a triangle is the symmetric 4x4 matrix
+	// of the outer product:
+	//              ┌─    ─┐
+	//              │ n.x  │┌─                ─┐
+	//    [Qₜ]₄,₄ = │ n.y  ││ n.x n.y n.z -n⋅p │,
+	//              │ n.z  │└─                ─┘
+	//              │-n⋅p  │
+	//              └─    ─┘
+	// where (n.x, n.y, n.z) is the unit normal vector of the triangle, and
+	// n⋅p is the inner product of n and an arbitrary point p on the plane of
+	// the triangle = the distance from the origin to the plane of the
+	// triangle.  In the implementation, it uses the position p0 of the first
+	// vertex of the triangle.
+	//
+	// On initialization (iteration == 0), each edge of each triangle gets
+	// a quadric error measure err using calculate_error().  For example, an
+	// edge between the first vertex v₀ and the second vertex v₁ of
+	// Triangle t gets the error measure err as:
+	//
+	//     t.err[0] = calculate_error(v₀, v₁)
+	//
+	//       [Qᵥ₀ + Qᵥ₁] =
+	//
+	//
+	// Additionally, the Triangle t.err[3] is the minimum quadric error
+	// among its three edges t.err[0], t.err[1], and t.err[2], where
+	// edge j is from vertex vⱼ to vertex vⱼ₊₁ (index modulo 3).
+	//
+	//
+	// 		loopi(0,triangles.size())
+	//		{
+	//			// Calc Edge Error
+	//			Triangle &t=triangles[i];vec3f p;
+	//			loopj(0,3) t.err[j]=calculate_error(t.v[j],t.v[(j+1)%3],p);
+	//			t.err[3]=min(t.err[0],min(t.err[1],t.err[2]));
+	//		}
 	//
 	void update_mesh(int iteration);
 
@@ -718,7 +796,7 @@ namespace SimplifyTet
 					// records.
 					v0.tcount=tcount;
 					break;
-				}
+				}  // end loopj(0,3)
 				// done?
 				if(num_triangles-num_deleted_triangles<=target_count)break;
 			}
@@ -1163,6 +1241,13 @@ namespace SimplifyTet
 		const SymetricMatrix q = vertices[id_v1].q + vertices[id_v2].q;
 		const bool border = vertices[id_v1].border & vertices[id_v2].border;
 		double error=0;
+		//             ┌           ┐
+		//             │Q₁₁ Q₁₂ Q₁₃│ Q₁₄
+		// [Q_δ]₃,₃ =  │    Q₂₂ Q₂₃│ Q₂₄
+		//             │        Q₃₃│ Q₃₄
+		//             -----------------
+		//             └           ┘ Q₄₄
+		//
 		const double det = q.det(0, 1, 2, 1, 4, 5, 2, 5, 7);
 		if ( det != 0 && !border )
 		{
